@@ -1,13 +1,12 @@
 # agents/router_agent_server.py
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from starlette.applications import Starlette
@@ -24,7 +23,7 @@ BASE_URL = f"http://{HOST}:{PORT}"
 DATA_URL = os.environ.get("DATA_URL", "http://127.0.0.1:8001")
 SUPPORT_URL = os.environ.get("SUPPORT_URL", "http://127.0.0.1:8002")
 
-# Your notebook uses RPC path "/"
+# Notebook uses RPC path "/"
 DATA_RPC_PATH = os.environ.get("DATA_RPC_PATH", "/")
 SUPPORT_RPC_PATH = os.environ.get("SUPPORT_RPC_PATH", "/")
 ROUTER_RPC_PATH = os.environ.get("ROUTER_RPC_PATH", "/")
@@ -50,7 +49,7 @@ def build_card() -> AgentCard:
                 description="Detects intent and coordinates Data and Support agents to answer multi-intent and multi-step queries.",
                 tags=["router", "a2a", "coordination"],
                 examples=[
-                    "I need help with my account, customer ID 12345",
+                    "I need help with my account, customer ID 5",
                     "I want to cancel my subscription but I'm having billing issues",
                     "Show me all active customers who have open tickets",
                 ],
@@ -74,19 +73,26 @@ def detect_intent(text: str) -> Dict[str, bool]:
     t = (text or "").lower()
     return {
         "has_customer_id": extract_customer_id(text) is not None,
-        "account_help": any(k in t for k in ["account", "upgrade", "login", "access"]),
+        "account_help": any(k in t for k in ["account", "upgrade", "login", "access", "help"]),
         "cancel": any(k in t for k in ["cancel", "cancellation", "subscription"]),
         "billing": any(k in t for k in ["billing", "charge", "charged", "invoice", "payment"]),
         "list_active_open": ("active customers" in t and ("open ticket" in t or "open tickets" in t)),
     }
 
 
-async def a2a_send(base_url: str, rpc_path: str, user_text: str, timeout_s: float = 15.0) -> Dict[str, Any]:
+def _join_url(base_url: str, rpc_path: str) -> str:
+    # base_url may be "http://127.0.0.1:8001" (no trailing slash)
+    # rpc_path in this repo is "/" (root)
+    base = base_url.rstrip("/")
+    path = rpc_path if rpc_path.startswith("/") else f"/{rpc_path}"
+    return base + path
+
+
+async def a2a_send(base_url: str, rpc_path: str, user_text: str, timeout_s: float = 20.0) -> Dict[str, Any]:
     """
     Sends JSON-RPC message/send to POST {base_url}{rpc_path}.
-    Returns raw JSON response.
     """
-    url = base_url.rstrip("/") + (rpc_path if rpc_path.startswith("/") else f"/{rpc_path}")
+    url = _join_url(base_url, rpc_path)
     payload = {
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
@@ -107,15 +113,49 @@ async def a2a_send(base_url: str, rpc_path: str, user_text: str, timeout_s: floa
 
 def extract_text_from_a2a(resp: Dict[str, Any]) -> str:
     if "result" not in resp:
-        return json.dumps(resp)
+        return json.dumps(resp, indent=2)
     parts = resp["result"].get("parts", []) or []
-    texts = []
+    texts: List[str] = []
     for p in parts:
         if isinstance(p, dict) and p.get("kind") == "text":
             texts.append(p.get("text", ""))
         elif isinstance(p, dict) and "text" in p:
             texts.append(p["text"])
-    return "\n".join([t for t in texts if t]).strip() or json.dumps(resp)
+    out = "\n".join([t for t in texts if t]).strip()
+    return out or json.dumps(resp, indent=2)
+
+
+def _safe_json_loads(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _md_escape(text: str) -> str:
+    # Minimal escape for markdown table cells
+    return (text or "").replace("\n", " ").replace("|", "\\|").strip()
+
+
+def _make_md_table(rows: List[Dict[str, Any]]) -> str:
+    header = "| customer_id | customer_name | email | ticket_id | priority | status | issue |\n|---:|---|---|---:|---|---|---|"
+    if not rows:
+        return header + "\n| (none) | (none) | (none) | (none) | (none) | (none) | No open tickets found |"
+
+    lines = [header]
+    for r in rows:
+        lines.append(
+            "| {customer_id} | {customer_name} | {email} | {ticket_id} | {priority} | {status} | {issue} |".format(
+                customer_id=r.get("customer_id", ""),
+                customer_name=_md_escape(r.get("customer_name", "")),
+                email=_md_escape(r.get("email", "")),
+                ticket_id=r.get("ticket_id", ""),
+                priority=_md_escape(str(r.get("priority", ""))),
+                status=_md_escape(str(r.get("status", ""))),
+                issue=_md_escape(r.get("issue", "")),
+            )
+        )
+    return "\n".join(lines)
 
 
 async def handle_router(user_text: str) -> str:
@@ -123,165 +163,145 @@ async def handle_router(user_text: str) -> str:
     Deterministic routing for your assignment demos:
     - Scenario 1: customer ID + account help -> Data then Support then synthesize
     - Scenario 2: cancel + billing -> Support, and if customer id present then also Data context
-    - Scenario 3: active customers with open tickets -> multi-step via Data, plus Support to format
+    - Scenario 3: active customers with open tickets -> multi-step via Data, Router formats table (no Support formatting)
     """
     intent = detect_intent(user_text)
     cid = extract_customer_id(user_text)
-    log_lines = []
-    log_lines.append(f"[router] time={now_iso()}")
-    log_lines.append(f"[router] DATA_URL={DATA_URL}{DATA_RPC_PATH} SUPPORT_URL={SUPPORT_URL}{SUPPORT_RPC_PATH}")
 
-    # Helper to call agents and always log
-    async def call_agent(label: str, url: str, path: str, msg: str) -> Tuple[str, str]:
+    # Short, readable log (for demo screenshots)
+    log_short: List[str] = []
+    log_short.append(f"[router] time={now_iso()}")
+    log_short.append(f"[router] DATA={DATA_URL}{DATA_RPC_PATH} SUPPORT={SUPPORT_URL}{SUPPORT_RPC_PATH}")
+
+    async def call_agent(label: str, url: str, path: str, msg: str) -> Tuple[bool, str]:
         try:
             resp = await a2a_send(url, path, msg)
             text = extract_text_from_a2a(resp)
-            log_lines.append(f"[router] {label} call OK: {msg[:120]!r}")
-            return "OK", text
+            log_short.append(f"[router] {label} OK: {_md_escape(msg)[:90]}")
+            return True, text
         except Exception as e:
-            log_lines.append(f"[router] {label} call FAIL: {type(e).__name__}: {e}")
-            return "FAIL", f"{label} call failed: {type(e).__name__}: {e}"
+            log_short.append(f"[router] {label} FAIL: {type(e).__name__}: {e}")
+            return False, f"{label} call failed: {type(e).__name__}: {e}"
 
-    # Scenario 3: "Show me all active customers who have open tickets"
+    # Scenario 3
     if intent["list_active_open"]:
-        # Step 1: ask Data for active customers list via MCP
-        status1, active_text = await call_agent(
-            "DATA",
-            DATA_URL,
-            DATA_RPC_PATH,
-            "List active customers"
-        )
+        ok_active, active_text = await call_agent("DATA", DATA_URL, DATA_RPC_PATH, "List active customers")
 
-        # Parse JSON if possible
-        active_ids = []
-        try:
-            active_json = json.loads(active_text)
-            customers = active_json.get("customers") or active_json.get("content", {}).get("customers") or []
+        active_ids: List[int] = []
+        customers_by_id: Dict[int, Dict[str, Any]] = {}
+
+        active_json = _safe_json_loads(active_text)
+        if active_json:
+            # Data agent might return either {"customers":[...]} or {"content":{"customers":[...]}}
+            customers = active_json.get("customers") or (active_json.get("content") or {}).get("customers") or []
             for c in customers:
                 if isinstance(c, dict) and "id" in c:
-                    active_ids.append(int(c["id"]))
-        except Exception:
-            customers = None
+                    c_id = int(c["id"])
+                    active_ids.append(c_id)
+                    customers_by_id[c_id] = c
 
-        # Step 2: for each customer, get ticket history and filter open tickets (best-effort)
-        open_hits = []
-        if active_ids:
-            for c_id in active_ids[:15]:  # keep demo fast
-                status2, hist_text = await call_agent(
-                    "DATA",
-                    DATA_URL,
-                    DATA_RPC_PATH,
-                    f"Show ticket history for customer ID {c_id}"
-                )
-                try:
-                    hist_json = json.loads(hist_text)
-                    tickets = hist_json.get("tickets") or hist_json.get("content", {}).get("tickets") or []
-                    for t in tickets:
-                        if isinstance(t, dict) and t.get("status") == "open":
-                            open_hits.append(
-                                {"customer_id": c_id, "ticket_id": t.get("id"), "priority": t.get("priority"), "issue": t.get("issue")}
-                            )
-                except Exception:
+        # Keep demo fast and stable
+        active_ids = active_ids[:15]
+
+        open_rows: List[Dict[str, Any]] = []
+
+        # For each active customer, pull ticket history and filter status == "open"
+        for c_id in active_ids:
+            ok_hist, hist_text = await call_agent("DATA", DATA_URL, DATA_RPC_PATH, f"Show ticket history for customer ID {c_id}")
+            hist_json = _safe_json_loads(hist_text)
+            if not hist_json:
+                continue
+
+            tickets = hist_json.get("tickets") or (hist_json.get("content") or {}).get("tickets") or []
+            for t in tickets:
+                if not isinstance(t, dict):
+                    continue
+                if t.get("status") != "open":
                     continue
 
-        # Step 3: ask Support to present the report
-        status3, support_text = await call_agent(
-            "SUPPORT",
-            SUPPORT_URL,
-            SUPPORT_RPC_PATH,
-            "You are formatting a report, not triaging. Return ONLY a markdown table with columns: customer_id, ticket_id, priority, issue. No other text."
-        )
+                cust = customers_by_id.get(c_id, {})
+                open_rows.append(
+                    {
+                        "customer_id": c_id,
+                        "customer_name": cust.get("name", ""),
+                        "email": cust.get("email", ""),
+                        "ticket_id": t.get("id", ""),
+                        "priority": t.get("priority", ""),
+                        "status": t.get("status", ""),
+                        "issue": t.get("issue", ""),
+                    }
+                )
 
-        
+        # Sort: high -> medium -> low, then customer id
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        open_rows.sort(key=lambda r: (priority_rank.get(str(r.get("priority", "")).lower(), 9), int(r.get("customer_id", 0))))
 
-        report = {
-            "active_customer_ids_checked": active_ids[:15],
-            "open_tickets_found": open_hits,
-        }
+        table = _make_md_table(open_rows)
 
-        final = []
-        final.append("Coordinated answer (Router -> Data multi-step, plus Support for formatting):")
-        final.append(json.dumps(report, indent=2))
-        final.append("")
-        final.append("Support formatting guidance:")
-        final.append(support_text)
-        final.append("")
-        final.append("A2A routing log:")
-        final.extend(log_lines)
-        return "\n".join(final)
+        final_lines: List[str] = []
+        final_lines.append("Active customers with open tickets (coordinated via Router -> Data, multi-step):")
+        final_lines.append("")
+        final_lines.append(table)
+        final_lines.append("")
+        final_lines.append("A2A log (short):")
+        final_lines.extend([f"- {x}" for x in log_short])
+        return "\n".join(final_lines)
 
-    # Scenario 2: cancellation + billing issues
+    # Scenario 2
     if intent["cancel"] and intent["billing"]:
-        # Ask Support first
-        status_s, support_text = await call_agent(
-            "SUPPORT",
-            SUPPORT_URL,
-            SUPPORT_RPC_PATH,
-            user_text
-        )
+        ok_s, support_text = await call_agent("SUPPORT", SUPPORT_URL, SUPPORT_RPC_PATH, user_text)
 
-        # If customer id present, fetch context
         data_text = ""
         if cid is not None:
-            status_d, data_text = await call_agent(
-                "DATA",
-                DATA_URL,
-                DATA_RPC_PATH,
-                f"Get customer information for ID {cid}"
-            )
+            ok_d, data_text = await call_agent("DATA", DATA_URL, DATA_RPC_PATH, f"Get customer information for ID {cid}")
 
-        final = []
-        final.append("Coordinated answer (Router -> Support, optionally Data context):")
+        final: List[str] = []
+        final.append("Coordinated answer (Router -> Support, with Data context if available):")
+        final.append("")
         if data_text:
-            final.append("Customer context from Data Agent:")
+            final.append("Customer context (Data Agent):")
             final.append(data_text)
             final.append("")
-        final.append("Support Agent response:")
+        final.append("Support response:")
         final.append(support_text)
         final.append("")
-        final.append("A2A routing log:")
-        final.extend(log_lines)
+        final.append("A2A log (short):")
+        final.extend([f"- {x}" for x in log_short])
         return "\n".join(final)
 
-    # Scenario 1: account help with customer ID
-    if intent["has_customer_id"] and (intent["account_help"] or "help" in (user_text or "").lower()):
-        # Step 1: Data context
-        status_d, data_text = await call_agent(
-            "DATA",
-            DATA_URL,
-            DATA_RPC_PATH,
-            f"Get customer information for ID {cid}"
-        )
-        # Step 2: Support advice using the context (we pass it as text)
-        status_s, support_text = await call_agent(
+    # Scenario 1
+    if intent["has_customer_id"] and intent["account_help"]:
+        ok_d, data_text = await call_agent("DATA", DATA_URL, DATA_RPC_PATH, f"Get customer information for ID {cid}")
+        ok_s, support_text = await call_agent(
             "SUPPORT",
             SUPPORT_URL,
             SUPPORT_RPC_PATH,
-            f"User asked: {user_text}\n\nCustomer context:\n{data_text}\n\nPlease provide next steps."
+            f"User asked: {user_text}\n\nCustomer context:\n{data_text}\n\nPlease provide next steps.",
         )
 
-        final = []
+        final: List[str] = []
         final.append("Coordinated answer (Router -> Data then Support):")
-        final.append("Customer context from Data Agent:")
+        final.append("")
+        final.append("Customer context (Data Agent):")
         final.append(data_text)
         final.append("")
-        final.append("Support Agent response:")
+        final.append("Support response:")
         final.append(support_text)
         final.append("")
-        final.append("A2A routing log:")
-        final.extend(log_lines)
+        final.append("A2A log (short):")
+        final.extend([f"- {x}" for x in log_short])
         return "\n".join(final)
 
-    # Default: pick best single agent
+    # Default routing
     if intent["has_customer_id"]:
-        status_d, data_text = await call_agent("DATA", DATA_URL, DATA_RPC_PATH, user_text)
+        ok_d, data_text = await call_agent("DATA", DATA_URL, DATA_RPC_PATH, user_text)
         return "\n".join(
-            ["Routed to Data Agent:", data_text, "", "A2A routing log:"] + log_lines
+            ["Routed to Data Agent:", "", data_text, "", "A2A log (short):"] + [f"- {x}" for x in log_short]
         )
 
-    status_s, support_text = await call_agent("SUPPORT", SUPPORT_URL, SUPPORT_RPC_PATH, user_text)
+    ok_s, support_text = await call_agent("SUPPORT", SUPPORT_URL, SUPPORT_RPC_PATH, user_text)
     return "\n".join(
-        ["Routed to Support Agent:", support_text, "", "A2A routing log:"] + log_lines
+        ["Routed to Support Agent:", "", support_text, "", "A2A log (short):"] + [f"- {x}" for x in log_short]
     )
 
 
