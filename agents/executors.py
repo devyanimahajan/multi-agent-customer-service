@@ -11,7 +11,6 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
-# OpenAI (uses OPENAI_API_KEY + OPENAI_MODEL from env)
 from openai import OpenAI
 
 
@@ -47,10 +46,9 @@ def _a2a_text_response(text: str) -> Dict[str, Any]:
 
 
 # ----------------------------
-# OpenAI helper (matches your env vars)
+# OpenAI helper 
 # ----------------------------
 def _openai_client() -> OpenAI:
-    # OPENAI_API_KEY must be in env (your notebook sets it)
     return OpenAI()
 
 
@@ -69,7 +67,7 @@ def _llm_text(system: str, user: str, temperature: float = 0.2) -> str:
 
 
 # ----------------------------
-# MCP stdio client (talks to your mcp_server.py exactly)
+# MCP stdio client
 # ----------------------------
 @dataclass
 class _MCPProcess:
